@@ -1,586 +1,282 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useState } from 'react';
 import mqtt, { MqttClient } from 'mqtt';
-import { Power, Play, Square, AlertTriangle, Home, Mic, MicOff, Trash2, Zap, Shuffle } from 'lucide-react';
+import { Thermometer, Droplets, Power, Play, Square, Loader2, AlertTriangle, Cpu } from 'lucide-react';
 
-// ─── MQTT Topics ──────────────────────────────────────────────────────────────
 const TOPICS = {
   STATUS_RELAY: 'iot/rumah2/relay/status',
-  CMD_RELAY:    'iot/rumah2/relay/command',
-  DATA_SENSOR:  'iot/rumah2/sensor/data',
-  STATUS_VAR:   'iot/rumah2/variasi/status',
-  CMD_VAR:      'iot/rumah2/variasi/command',
-  CMD_ALL:      'iot/rumah2/relay/allcommand',
+  CMD_RELAY: 'iot/rumah2/relay/command',
+  DATA_SENSOR: 'iot/rumah2/sensor/data',
+  STATUS_VAR: 'iot/rumah2/variasi/status',
+  CMD_VAR: 'iot/rumah2/variasi/command',
+  CMD_ALL: 'iot/rumah2/relay/allcommand'
 };
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-type RelayState = Record<number, boolean>;
-type LogType    = 'on' | 'off' | 'info' | 'warn' | 'voice' | 'err';
-type LogSource  = 'web' | 'voice' | 'auto' | 'sys';
-interface LogEntry { time: string; msg: string; type: LogType; source: LogSource; }
-type VoiceResultType = 'ok' | 'err' | 'unk' | null;
-
-const RELAY_IDS = [1, 2, 3, 4] as const;
-
-// ─── Variation sequences ──────────────────────────────────────────────────────
-// Variasi 1: bolak-balik ujung ke ujung  1→2→3→4→3→2→1
-const VAR1_SEQ = [1, 2, 3, 4, 3, 2, 1];
-// Variasi 2: nyala satu per satu 1→2→3→4 (akumulatif), lalu reset
-const VAR2_STEPS = [
-  { 1: true,  2: false, 3: false, 4: false },
-  { 1: true,  2: true,  3: false, 4: false },
-  { 1: true,  2: true,  3: true,  4: false },
-  { 1: true,  2: true,  3: true,  4: true  },
-  { 1: false, 2: false, 3: false, 4: false }, // reset
-];
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-function numWord(w: string): number {
-  const m: Record<string,number> = { satu:1, dua:2, tiga:3, empat:4, one:1, two:2, three:3, four:4 };
-  return m[w] ?? parseInt(w);
-}
-function nowTime(): string {
-  const d = new Date();
-  return [d.getHours(), d.getMinutes(), d.getSeconds()].map(n => String(n).padStart(2,'0')).join(':');
-}
-function allOff(): RelayState { return { 1:false, 2:false, 3:false, 4:false }; }
-
-// ─── Component ────────────────────────────────────────────────────────────────
 export default function App() {
-  // MQTT
-  const [client, setClient]           = useState<MqttClient | null>(null);
-  const [connected, setConnected]     = useState(false);
-  const [relays, setRelays]           = useState<RelayState>(allOff());
-  const [sensor, setSensor]           = useState({ suhu:'--', kelembaban:'--', lastUpdate:'--:--:--' });
-  const [variasi, setVariasi]         = useState(0);           // 0 = manual, 1/2/3 = variasi aktif
+  const [client, setClient] = useState<MqttClient | null>(null);
+  const [connected, setConnected] = useState(false);
+  const [relays, setRelays] = useState({ 1: false, 2: false, 3: false, 4: false });
+  const [sensor, setSensor] = useState({ suhu: '--', kelembaban: '--', lastUpdate: '--:--:--' });
+  const [variasi, setVariasi] = useState(0);
+  const [loadingRelays, setLoadingRelays] = useState<Record<number, boolean>>({});
 
-  // Voice
-  const [isListening, setIsListening] = useState(false);
-  const [transcript, setTranscript]   = useState('');
-  const [voiceResult, setVoiceResult] = useState<{ type: VoiceResultType; msg: string } | null>(null);
-  const recognitionRef   = useRef<any>(null);
-  const voiceResultTimer = useRef<ReturnType<typeof setTimeout>|null>(null);
-
-  // Log
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-
-  // Variation timers
-  const varTimerRef  = useRef<ReturnType<typeof setInterval>|null>(null);
-  const varStepRef   = useRef(0);
-  const varActiveRef = useRef(0); // mirrors variasi state for timer closures
-
-  // Refs for closures
-  const clientRef    = useRef(client);
-  const connectedRef = useRef(connected);
-  const variasiRef   = useRef(variasi);
-  const relaysRef    = useRef(relays);
-
-  useEffect(() => { clientRef.current    = client;    }, [client]);
-  useEffect(() => { connectedRef.current = connected; }, [connected]);
-  useEffect(() => { variasiRef.current   = variasi;   }, [variasi]);
-  useEffect(() => { relaysRef.current    = relays;    }, [relays]);
-
-  // ── Log ─────────────────────────────────────────────────────────────────────
-  const addLog = useCallback((msg: string, type: LogType = 'info', source: LogSource = 'sys') => {
-    setLogs(prev => [{ time: nowTime(), msg, type, source }, ...prev].slice(0, 100));
-  }, []);
-
-  // ── Publish relay state helper (also updates local state) ──────────────────
-  const publishRelay = useCallback((id: number, state: boolean, source: LogSource = 'web') => {
-    clientRef.current?.publish(TOPICS.CMD_RELAY, JSON.stringify({ relay: id, state }));
-    setRelays(prev => ({ ...prev, [id]: state }));
-    addLog(`Lampu ${id} ${state ? 'dinyalakan' : 'dimatikan'}`, state ? 'on' : 'off', source);
-  }, [addLog]);
-
-  const publishAll = useCallback((state: boolean, source: LogSource = 'web') => {
-    clientRef.current?.publish(TOPICS.CMD_ALL, JSON.stringify({ state }));
-    setRelays({ 1:state, 2:state, 3:state, 4:state });
-    addLog(`Semua lampu ${state ? 'dinyalakan' : 'dimatikan'}`, state ? 'on' : 'off', source);
-  }, [addLog]);
-
-  // ── Stop variation timer ───────────────────────────────────────────────────
-  const stopVarTimer = useCallback(() => {
-    if (varTimerRef.current) { clearInterval(varTimerRef.current); varTimerRef.current = null; }
-    varStepRef.current  = 0;
-    varActiveRef.current = 0;
-  }, []);
-
-  // ── Start variation ────────────────────────────────────────────────────────
-  const startVariation = useCallback((v: number) => {
-    stopVarTimer();
-    varActiveRef.current = v;
-    varStepRef.current   = 0;
-
-    if (v === 1) {
-      // Bolak-balik: 1→2→3→4→3→2→1, hanya satu lampu menyala per step
-      const step = () => {
-        if (varActiveRef.current !== 1) return;
-        const idx = varStepRef.current % VAR1_SEQ.length;
-        const activeId = VAR1_SEQ[idx];
-        const newState: RelayState = { 1:false, 2:false, 3:false, 4:false };
-        newState[activeId] = true;
-        setRelays(newState);
-        clientRef.current?.publish(TOPICS.CMD_RELAY, JSON.stringify({ relay: activeId, state: true }));
-        // turn off others
-        RELAY_IDS.forEach(id => { if (id !== activeId) clientRef.current?.publish(TOPICS.CMD_RELAY, JSON.stringify({ relay: id, state: false })); });
-        varStepRef.current++;
-      };
-      step();
-      varTimerRef.current = setInterval(step, 500);
-
-    } else if (v === 2) {
-      // Akumulatif: nyala 1 demi 1 lalu reset
-      const step = () => {
-        if (varActiveRef.current !== 2) return;
-        const idx = varStepRef.current % VAR2_STEPS.length;
-        const snap = VAR2_STEPS[idx] as RelayState;
-        setRelays({ ...snap });
-        RELAY_IDS.forEach(id => {
-          clientRef.current?.publish(TOPICS.CMD_RELAY, JSON.stringify({ relay: id, state: snap[id] }));
-        });
-        varStepRef.current++;
-      };
-      step();
-      varTimerRef.current = setInterval(step, 600);
-
-    } else if (v === 3) {
-      // Bebas: kedip acak
-      const step = () => {
-        if (varActiveRef.current !== 3) return;
-        const newState: RelayState = { 1:false, 2:false, 3:false, 4:false };
-        RELAY_IDS.forEach(id => { newState[id] = Math.random() > 0.5; });
-        setRelays(newState);
-        RELAY_IDS.forEach(id => {
-          clientRef.current?.publish(TOPICS.CMD_RELAY, JSON.stringify({ relay: id, state: newState[id] }));
-        });
-      };
-      step();
-      varTimerRef.current = setInterval(step, 400);
-    }
-  }, [stopVarTimer]);
-
-  // ── Set variasi (publish + start local timer) ──────────────────────────────
-  const setVariation = useCallback((v: number) => {
-    if (!clientRef.current || !connectedRef.current) return;
-    clientRef.current.publish(TOPICS.CMD_VAR, JSON.stringify({ variasi: v }));
-    setVariasi(v);
-    if (v === 0) {
-      stopVarTimer();
-      publishAll(false, 'web');
-      addLog('Variasi dihentikan', 'off', 'web');
-    } else {
-      startVariation(v);
-      addLog(`Variasi ${v} diaktifkan`, 'on', 'web');
-    }
-  }, [stopVarTimer, startVariation, publishAll, addLog]);
-
-  // Sync varActiveRef when variasi state changes (e.g. from MQTT)
   useEffect(() => {
-    varActiveRef.current = variasi;
-    if (variasi > 0) startVariation(variasi);
-    else stopVarTimer();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [variasi]);
-
-  // ── MQTT setup ──────────────────────────────────────────────────────────────
-  useEffect(() => {
-    const mqttClient = mqtt.connect('wss://broker.hivemq.com:8884/mqtt', {
-      clientId: `web_${Math.random().toString(16).slice(2,10)}`,
-      keepalive: 60, protocolVersion: 4, clean: true,
-      reconnectPeriod: 2000, connectTimeout: 30000,
+    // Generate unique client ID to avoid disconnections
+    const clientId = `web_${Math.random().toString(16).slice(2, 10)}`;
+    const host = 'wss://broker.hivemq.com:8884/mqtt';
+    
+    // Connect to the public HiveMQ web socket broker
+    const mqttClient = mqtt.connect(host, {
+      clientId,
+      keepalive: 60,
+      protocolVersion: 4,
+      clean: true,
+      reconnectPeriod: 2000,
+      connectTimeout: 30 * 1000,
     });
+
     setClient(mqttClient);
 
     mqttClient.on('connect', () => {
       setConnected(true);
+      // Subscribe to all required uplink topics
       mqttClient.subscribe([TOPICS.STATUS_RELAY, TOPICS.DATA_SENSOR, TOPICS.STATUS_VAR]);
-      addLog('Terhubung ke broker MQTT', 'info', 'sys');
+      setLoadingRelays({});
     });
-    mqttClient.on('reconnect', () => { setConnected(false); addLog('Menghubungkan ulang...', 'warn', 'sys'); });
-    mqttClient.on('offline',   () => { setConnected(false); addLog('Koneksi terputus', 'err', 'sys'); });
-    mqttClient.on('error', err => addLog(`Error MQTT: ${err.message}`, 'err', 'sys'));
+
+    mqttClient.on('reconnect', () => setConnected(false));
+    mqttClient.on('offline', () => setConnected(false));
+    mqttClient.on('error', (err) => console.error('MQTT Error:', err));
 
     mqttClient.on('message', (topic, message) => {
       try {
-        const p = JSON.parse(message.toString());
-        if (topic === TOPICS.STATUS_RELAY) {
-          // Only update from MQTT if no local variation running
-          if (varActiveRef.current === 0)
-            setRelays({ 1: !!p.relay1, 2: !!p.relay2, 3: !!p.relay3, 4: !!p.relay4 });
-        } else if (topic === TOPICS.DATA_SENSOR) {
-          setSensor({ suhu: p.suhu ?? '--', kelembaban: p.kelembaban ?? '--', lastUpdate: nowTime() });
-        } else if (topic === TOPICS.STATUS_VAR) {
-          setVariasi(p.variasi || 0);
+        const payload = JSON.parse(message.toString());
+        
+        switch (topic) {
+          case TOPICS.STATUS_RELAY:
+            setRelays({
+              1: payload.relay1 || false,
+              2: payload.relay2 || false,
+              3: payload.relay3 || false,
+              4: payload.relay4 || false,
+            });
+            setLoadingRelays({}); // Clear loading spinners when status is confirmed
+            break;
+
+          case TOPICS.DATA_SENSOR:
+            const now = new Date();
+            const timeString = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`;
+            
+            setSensor({
+              suhu: payload.suhu ?? '--',
+              kelembaban: payload.kelembaban ?? '--',
+              lastUpdate: timeString
+            });
+            break;
+
+          case TOPICS.STATUS_VAR:
+            setVariasi(payload.variasi || 0);
+            break;
         }
-      } catch { /* ignore */ }
+      } catch (e) {
+        console.error('Invalid JSON payload received on topic:', topic, e);
+      }
     });
 
-    return () => { mqttClient.end(); stopVarTimer(); };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // ── Manual relay toggle (stops variasi first if active) ────────────────────
-  const toggleRelay = useCallback((id: number) => {
-    if (!clientRef.current || !connectedRef.current) return;
-    if (variasiRef.current > 0) {
-      // Stop variasi then toggle
-      clientRef.current.publish(TOPICS.CMD_VAR, JSON.stringify({ variasi: 0 }));
-      setVariasi(0);
-      stopVarTimer();
-      addLog('Variasi dihentikan (manual override)', 'off', 'web');
-    }
-    const newState = !relaysRef.current[id];
-    publishRelay(id, newState, 'web');
-  }, [stopVarTimer, publishRelay, addLog]);
-
-  const handleSetAllRelays = useCallback((state: boolean) => {
-    if (!clientRef.current || !connectedRef.current) return;
-    if (variasiRef.current > 0) {
-      clientRef.current.publish(TOPICS.CMD_VAR, JSON.stringify({ variasi: 0 }));
-      setVariasi(0);
-      stopVarTimer();
-    }
-    publishAll(state, 'web');
-  }, [stopVarTimer, publishAll]);
-
-  // ── Voice result ─────────────────────────────────────────────────────────────
-  const showVoiceResult = useCallback((type: VoiceResultType, msg: string) => {
-    setVoiceResult({ type, msg });
-    if (voiceResultTimer.current) clearTimeout(voiceResultTimer.current);
-    voiceResultTimer.current = setTimeout(() => setVoiceResult(null), 5000);
-  }, []);
-
-  // ── Voice processor ─────────────────────────────────────────────────────────
-  const processVoiceCommand = useCallback((text: string) => {
-    const t = text.toLowerCase().trim();
-    addLog(`Voice: "${text}"`, 'voice', 'voice');
-
-    if (!connectedRef.current) { showVoiceResult('err', 'Tidak terhubung ke broker'); return; }
-
-    const stopVarIfNeeded = () => {
-      if (variasiRef.current > 0) {
-        clientRef.current?.publish(TOPICS.CMD_VAR, JSON.stringify({ variasi: 0 }));
-        setVariasi(0);
-        stopVarTimer();
-        addLog('Variasi dihentikan (voice override)', 'off', 'voice');
-      }
+    // Cleanup on unmount
+    return () => {
+      mqttClient.end();
     };
+  }, []);
 
-    // Semua ON
-    if (/(nyala|hidupkan|on)\s*(semua|all)/.test(t) || /(semua|all).*(nyala|on)/.test(t)) {
-      stopVarIfNeeded();
-      publishAll(true, 'voice');
-      showVoiceResult('ok', '✓ Semua lampu dinyalakan'); return;
-    }
-    // Semua OFF
-    if (/(mati(kan)?|off)\s*(semua|all)/.test(t) || /(semua|all).*(mati|off)/.test(t)) {
-      stopVarIfNeeded();
-      publishAll(false, 'voice');
-      showVoiceResult('ok', '✓ Semua lampu dimatikan'); return;
-    }
-    // Stop variasi
-    if (/(stop|henti(kan)?|berhenti)\s*(variasi)?/.test(t) || /variasi.*(stop|off|mati|berhenti)/.test(t)) {
-      clientRef.current?.publish(TOPICS.CMD_VAR, JSON.stringify({ variasi: 0 }));
-      setVariasi(0); stopVarTimer();
-      publishAll(false, 'voice');
-      showVoiceResult('ok', '✓ Variasi dihentikan');
-      addLog('Voice → Stop variasi', 'off', 'voice'); return;
-    }
-    // Variasi 1 / 2 / 3
-    const varM = t.match(/variasi\s*(satu|1|dua|2|tiga|3|one|two|three)/);
-    if (varM) {
-      const n = /satu|1|one/.test(varM[1]) ? 1 : /dua|2|two/.test(varM[1]) ? 2 : 3;
-      clientRef.current?.publish(TOPICS.CMD_VAR, JSON.stringify({ variasi: n }));
-      setVariasi(n); startVariation(n);
-      showVoiceResult('ok', `✓ Variasi ${n} diaktifkan`);
-      addLog(`Voice → Variasi ${n}`, 'on', 'voice'); return;
-    }
-    // Lampu ON individual
-    const onM = t.match(/(nyala(kan)?|hidupkan|on|aktif(kan)?)\s*(lampu\s*)?(satu|1|dua|2|tiga|3|empat|4|one|two|three|four)/);
-    if (onM) {
-      const id = numWord(onM[5]);
-      stopVarIfNeeded();
-      publishRelay(id, true, 'voice');
-      showVoiceResult('ok', `✓ Lampu ${id} dinyalakan`); return;
-    }
-    // Lampu OFF individual
-    const offM = t.match(/(matikan|mati(kan)?|off)\s*(lampu\s*)?(satu|1|dua|2|tiga|3|empat|4|one|two|three|four)/);
-    if (offM) {
-      const id = numWord(offM[4]);
-      stopVarIfNeeded();
-      publishRelay(id, false, 'voice');
-      showVoiceResult('ok', `✓ Lampu ${id} dimatikan`); return;
-    }
+  const toggleRelay = (id: number) => {
+    if (!client || !connected || variasi > 0) return;
+    
+    setLoadingRelays(prev => ({ ...prev, [id]: true }));
+    const newState = !relays[id as keyof typeof relays];
+    client.publish(TOPICS.CMD_RELAY, JSON.stringify({ relay: id, state: newState }));
+    
+    // Safety fallback: dismiss the loading spinner if module takes too long to respond
+    setTimeout(() => {
+      setLoadingRelays(prev => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
+    }, 4000);
+  };
 
-    showVoiceResult('unk', `Tidak dikenali: "${text}"`);
-    addLog(`Tidak dikenali: "${text}"`, 'warn', 'voice');
-  }, [addLog, showVoiceResult, stopVarTimer, startVariation, publishRelay, publishAll]);
+  const setAllRelays = (state: boolean) => {
+    if (!client || !connected || variasi > 0) return;
+    client.publish(TOPICS.CMD_ALL, JSON.stringify({ state }));
+  };
 
-  // ── Mic toggle ───────────────────────────────────────────────────────────────
-  const toggleMic = useCallback(() => {
-    if (isListening) { recognitionRef.current?.stop(); return; }
-    const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SR) { showVoiceResult('err', 'Gunakan Chrome – Speech Recognition tidak didukung'); return; }
+  const setVariation = (id: number) => {
+    if (!client || !connected) return;
+    client.publish(TOPICS.CMD_VAR, JSON.stringify({ variasi: id }));
+  };
 
-    const rec = new SR();
-    rec.lang = 'id-ID'; rec.interimResults = true; rec.maxAlternatives = 1;
-    recognitionRef.current = rec;
-    let finalText = '';
-
-    rec.onstart  = () => { setIsListening(true);  setTranscript('🎙 Mendengarkan...'); setVoiceResult(null); };
-    rec.onresult = (e: any) => { finalText = Array.from(e.results as any[]).map((r:any) => r[0].transcript).join(''); setTranscript(finalText); };
-    rec.onend    = () => { setIsListening(false); setTranscript(''); if (finalText) processVoiceCommand(finalText); };
-    rec.onerror  = (e: any) => { setIsListening(false); setTranscript(''); showVoiceResult('err', `Error: ${e.error}`); addLog(`Voice error: ${e.error}`, 'err', 'voice'); };
-    rec.start();
-  }, [isListening, showVoiceResult, processVoiceCommand, addLog]);
-
-  // ── Derived ──────────────────────────────────────────────────────────────────
-  const isHighTemp       = parseFloat(sensor.suhu) >= 35.0;
+  const isHighTemp = parseFloat(sensor.suhu) >= 35.0;
   const isVariationActive = variasi > 0;
 
-  // ── Variation meta ────────────────────────────────────────────────────────────
-  const varMeta = [
-    { id:1, label:'Variasi 1', desc:'Bolak-balik 1→2→3→4→3→2→1', icon: <Zap size={14}/> },
-    { id:2, label:'Variasi 2', desc:'Nyala bertahap 1→2→3→4',     icon: <Play size={14}/> },
-    { id:3, label:'Variasi 3', desc:'Kedip acak bebas',            icon: <Shuffle size={14}/> },
-  ];
-
-  // ── Render ───────────────────────────────────────────────────────────────────
   return (
-    <div style={{ minHeight:'100vh', background:'#080810', color:'#e8e6ff', fontFamily:"'Syne', sans-serif", overflowX:'hidden', position:'relative' }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=DM+Mono:wght@300;400;500&display=swap');
-        :root {
-          --accent:#6D5EF5; --accent-dim:rgba(109,94,245,0.15); --accent-glow:rgba(109,94,245,0.35);
-          --bg:#080810; --bg2:#0e0e1a; --bg3:#13131f;
-          --border:rgba(255,255,255,0.07); --border-accent:rgba(109,94,245,0.3);
-          --text:#e8e6ff; --muted:#4a4870; --muted2:#2a2845;
-          --success:#3dd68c; --danger:#ff5f7e; --warn:#f5a623;
-        }
-        *{box-sizing:border-box;}
-        .mono{font-family:'DM Mono',monospace;}
-        .bg-grid::before{content:'';position:fixed;inset:0;background-image:linear-gradient(rgba(109,94,245,0.03) 1px,transparent 1px),linear-gradient(90deg,rgba(109,94,245,0.03) 1px,transparent 1px);background-size:40px 40px;pointer-events:none;z-index:0;}
-        @keyframes blink{0%,100%{opacity:1}50%{opacity:.35}}
-        @keyframes micPulse{0%,100%{box-shadow:0 0 0 0 rgba(255,95,126,.3)}50%{box-shadow:0 0 0 14px rgba(255,95,126,0)}}
-        @keyframes relayGlow{0%,100%{box-shadow:0 0 6px rgba(109,94,245,0.6)}50%{box-shadow:0 0 16px rgba(109,94,245,1),0 0 30px rgba(109,94,245,0.4)}}
-        @keyframes spin{to{transform:rotate(360deg)}}
-        @keyframes logIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:translateY(0)}}
-        @keyframes varPing{0%,100%{box-shadow:0 0 0 0 rgba(109,94,245,.4)}60%{box-shadow:0 0 0 10px rgba(109,94,245,0)}}
-        .dot-blink{animation:blink 2s ease infinite;}
-        .mic-pulse{animation:micPulse 1.4s ease infinite;}
-        .led-glow{animation:relayGlow 2s ease-in-out infinite;}
-        .var-ping{animation:varPing 1.2s ease infinite;}
-        .spinner{width:14px;height:14px;border:2px solid currentColor;border-top-color:transparent;border-radius:50%;animation:spin .7s linear infinite;}
-        .card-hover{transition:border-color .2s,box-shadow .2s;}
-        .card-hover:hover{border-color:var(--border-accent)!important;}
-        .log-scroll{max-height:260px;overflow-y:auto;}
-        .log-scroll::-webkit-scrollbar{width:4px;}
-        .log-scroll::-webkit-scrollbar-thumb{background:var(--muted2);border-radius:4px;}
-        .log-row{animation:logIn .25s ease;}
-        button{cursor:pointer;}
-        button:disabled{opacity:.3;cursor:not-allowed!important;}
-        .relay-btn{display:flex;align-items:center;justify-content:center;gap:8px;padding:11px 16px;border-radius:10px;font-family:'Syne',sans-serif;font-size:13px;font-weight:700;border:none;transition:all .15s;width:100%;}
-        .relay-btn.is-on{background:var(--accent-dim);color:var(--accent);border:1px solid var(--border-accent);}
-        .relay-btn.is-off{background:var(--accent);color:#fff;box-shadow:0 4px 20px rgba(109,94,245,0.35);}
-        .relay-btn:hover:not(:disabled).is-on{background:rgba(109,94,245,.25);}
-        .relay-btn:hover:not(:disabled).is-off{background:#7d6ff7;box-shadow:0 4px 28px rgba(109,94,245,.5);}
-      `}</style>
-
-      <div className="bg-grid" style={{ position:'fixed', inset:0, pointerEvents:'none', zIndex:0 }} />
-
-      <div style={{ maxWidth:900, margin:'0 auto', padding:'28px 16px 60px', position:'relative', zIndex:1 }}>
-
-        {/* ── HEADER ── */}
-        <header style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:28, flexWrap:'wrap', gap:12 }}>
-          <div style={{ display:'flex', alignItems:'center', gap:12 }}>
-            <div style={{ width:38, height:38, background:'var(--accent-dim)', border:'1px solid var(--border-accent)', borderRadius:10, display:'flex', alignItems:'center', justifyContent:'center' }}>
-              <Home size={18} color="var(--accent)" />
-            </div>
-            <div>
-              <h1 style={{ fontSize:18, fontWeight:700, letterSpacing:'-0.02em', margin:0 }}>Smart Home</h1>
-              <p className="mono" style={{ fontSize:11, color:'var(--muted)', margin:0 }}>iot/rumah2 · HiveMQ</p>
-            </div>
+    <div className="min-h-screen bg-[#0D0D0D] text-gray-200 font-sans p-4 sm:p-8 flex flex-col items-center">
+      <div className="w-full max-w-2xl space-y-6">
+        
+        {/* Header & Connection Badge */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-[#2D2D2D] gap-4">
+          <div className="flex items-center space-x-3 text-orange-500">
+            <Cpu className="w-8 h-8" />
+            <h1 className="text-2xl font-bold tracking-tight text-white">Smart Home Node</h1>
           </div>
-          <div style={{ display:'flex', alignItems:'center', gap:6, padding:'6px 12px', borderRadius:20, fontSize:11, fontWeight:500, border:'1px solid', ...(connected ? { background:'rgba(61,214,140,0.08)', borderColor:'rgba(61,214,140,0.2)', color:'var(--success)' } : { background:'rgba(255,95,126,0.08)', borderColor:'rgba(255,95,126,0.2)', color:'var(--danger)' }) }} className="mono">
-            <div className={connected ? 'dot-blink' : ''} style={{ width:7, height:7, borderRadius:'50%', background: connected ? 'var(--success)' : 'var(--danger)' }} />
-            {connected ? 'Online' : 'Offline'}
+          <div className={`self-start sm:self-auto flex items-center space-x-2 px-3 py-1.5 rounded-full text-[11px] uppercase font-bold tracking-wider ${connected ? 'bg-[#DD6B20]/15 text-[#ED8936]' : 'bg-gray-800/50 text-gray-500'}`}>
+            <div className={`w-2 h-2 rounded-full ${connected ? 'bg-[#DD6B20] animate-pulse' : 'bg-gray-500'}`}></div>
+            <span>{connected ? 'Connected' : 'Disconnected'}</span>
           </div>
-        </header>
+        </div>
 
-        {/* ── SENSOR + VOICE ── */}
-        <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(280px,1fr))', gap:14, marginBottom:14 }}>
-
-          {/* Sensor */}
-          <div className="card-hover" style={{ background:'var(--bg2)', border:'1px solid var(--border)', borderRadius:16, padding:20 }}>
-            <div className="mono" style={{ fontSize:11, fontWeight:600, letterSpacing:'.1em', textTransform:'uppercase', color:'var(--muted)', marginBottom:16, display:'flex', alignItems:'center', gap:8 }}>
-              Sensor DHT11
-            </div>
-            <div style={{ display:'flex', gap:24 }}>
-              <div style={{ flex:1 }}>
-                <div style={{ fontSize:42, fontWeight:800, lineHeight:1, letterSpacing:'-0.04em', color: isHighTemp ? 'var(--danger)' : 'var(--text)' }}>
-                  {sensor.suhu}<span style={{ fontSize:16, color:'var(--muted)', marginLeft:3 }}>°C</span>
-                </div>
-                <div className="mono" style={{ fontSize:11, color:'var(--muted)', marginTop:6 }}>Suhu</div>
-                {isHighTemp && (
-                  <div style={{ display:'inline-flex', alignItems:'center', gap:4, background:'rgba(255,95,126,0.1)', border:'1px solid rgba(255,95,126,0.25)', color:'var(--danger)', fontSize:10, padding:'2px 8px', borderRadius:4, marginTop:4 }} className="mono">
-                    <AlertTriangle size={10} /> PANAS
-                  </div>
-                )}
+        {/* Sensor Card */}
+        <div className="bg-[#1A1A1A] p-6 rounded-xl border border-[#2D2D2D] flex flex-col sm:flex-row sm:items-center justify-between gap-6">
+          <div className="space-y-1">
+            <h2 className="text-lg font-medium text-white flex items-center space-x-2">
+              <span>Environment</span>
+              {isHighTemp && <AlertTriangle className="w-5 h-5 text-red-500 animate-pulse" />}
+            </h2>
+            <p className="text-xs text-gray-500">Diperbarui: {sensor.lastUpdate}</p>
+          </div>
+          
+          <div className="flex items-center space-x-8">
+            <div className="flex items-center space-x-3">
+              <div className={`p-3 rounded-lg border ${isHighTemp ? 'bg-red-500/10 text-red-500 border-red-500/20' : 'bg-[#DD6B20]/10 text-[#DD6B20] border-[#DD6B20]/20'}`}>
+                <Thermometer className="w-6 h-6" />
               </div>
-              <div style={{ width:1, background:'var(--border)' }} />
-              <div style={{ flex:1 }}>
-                <div style={{ fontSize:42, fontWeight:800, lineHeight:1, letterSpacing:'-0.04em', color:'var(--text)' }}>
-                  {sensor.kelembaban}<span style={{ fontSize:16, color:'var(--muted)', marginLeft:3 }}>%</span>
+              <div>
+                <p className="text-xs font-semibold tracking-wider text-gray-500 uppercase">Suhu</p>
+                <div className="flex items-baseline space-x-1">
+                  <p className={`text-2xl font-bold ${isHighTemp ? 'text-red-500' : 'text-white'}`}>{sensor.suhu}</p>
+                  <span className="text-sm text-gray-400">°C</span>
                 </div>
-                <div className="mono" style={{ fontSize:11, color:'var(--muted)', marginTop:6 }}>Kelembaban</div>
               </div>
             </div>
-            <div className="mono" style={{ marginTop:14, fontSize:10, color:'var(--muted)' }}>Update: {sensor.lastUpdate}</div>
-          </div>
-
-          {/* Voice */}
-          <div style={{ background:'var(--bg2)', borderRadius:16, padding:20, border: isListening ? '1px solid rgba(255,95,126,0.5)' : '1px solid var(--border)', transition:'border-color .3s' }}>
-            <div className="mono" style={{ fontSize:11, fontWeight:600, letterSpacing:'.1em', textTransform:'uppercase', color:'var(--muted)', marginBottom:16, display:'flex', alignItems:'center', gap:8 }}>
-              <Mic size={13} color="var(--accent)" /> Perintah Suara
-            </div>
-            <div style={{ display:'flex', alignItems:'center', gap:16 }}>
-              <button
-                onClick={toggleMic}
-                className={isListening ? 'mic-pulse' : ''}
-                style={{ width:64, height:64, borderRadius:'50%', flexShrink:0, display:'flex', alignItems:'center', justifyContent:'center', background: isListening ? 'rgba(255,95,126,0.1)' : 'var(--bg3)', border: isListening ? '1px solid rgba(255,95,126,.5)' : '1px solid var(--border)', transition:'all .2s' }}
-              >
-                {isListening ? <MicOff size={26} color="#ff5f7e" /> : <Mic size={26} color="var(--accent)" />}
-              </button>
-              <div style={{ flex:1 }}>
-                <div className="mono" style={{ fontSize:13, color: transcript ? 'var(--text)' : 'var(--muted)', minHeight:20, marginBottom:8 }}>
-                  {transcript || 'Tekan mic untuk mulai...'}
-                </div>
-                {voiceResult && (
-                  <div className="mono" style={{ fontSize:12, padding:'7px 12px', borderRadius:8, ...(voiceResult.type === 'ok' ? { background:'rgba(61,214,140,0.08)', border:'1px solid rgba(61,214,140,0.2)', color:'var(--success)' } : voiceResult.type === 'err' ? { background:'rgba(255,95,126,0.08)', border:'1px solid rgba(255,95,126,0.2)', color:'var(--danger)' } : { background:'rgba(245,166,35,0.08)', border:'1px solid rgba(245,166,35,0.2)', color:'var(--warn)' }) }}>
-                    {voiceResult.msg}
-                  </div>
-                )}
+            
+            <div className="flex items-center space-x-3">
+              <div className="p-3 bg-[#DD6B20]/10 text-[#DD6B20] rounded-lg border border-[#DD6B20]/20">
+                <Droplets className="w-6 h-6" />
               </div>
-            </div>
-            <div style={{ marginTop:12, display:'flex', flexWrap:'wrap', gap:6 }}>
-              {['"nyalakan lampu 1"','"matikan semua"','"variasi satu"','"variasi dua"','"variasi tiga"','"stop variasi"'].map(h => (
-                <span key={h} className="mono" style={{ fontSize:10, padding:'3px 8px', borderRadius:4, background:'var(--muted2)', color:'var(--muted)', border:'1px solid rgba(255,255,255,0.05)' }}>{h}</span>
-              ))}
+              <div>
+                <p className="text-xs font-semibold tracking-wider text-gray-500 uppercase">Kelembaban</p>
+                <div className="flex items-baseline space-x-1">
+                  <p className="text-2xl font-bold text-white">{sensor.kelembaban}</p>
+                  <span className="text-sm text-gray-400">%</span>
+                </div>
+              </div>
             </div>
           </div>
         </div>
 
-        {/* ── RELAY SECTION ── */}
-        <div style={{ marginBottom:14 }}>
-          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:12, flexWrap:'wrap', gap:8 }}>
-            <div className="mono" style={{ fontSize:11, fontWeight:600, letterSpacing:'.1em', textTransform:'uppercase', color:'var(--muted)', display:'flex', alignItems:'center', gap:8 }}>
-              <Power size={13} color="var(--accent)" /> Kontrol Lampu
-              {isVariationActive && (
-                <span className="mono var-ping" style={{ fontSize:9, padding:'2px 8px', borderRadius:4, background:'rgba(109,94,245,0.15)', border:'1px solid rgba(109,94,245,0.3)', color:'var(--accent)', letterSpacing:'.05em' }}>
-                  VARIASI {variasi} AKTIF
-                </span>
-              )}
-            </div>
-            <div style={{ display:'flex', gap:8 }}>
-              {[{label:'Semua ON', state:true}, {label:'Semua OFF', state:false}].map(({ label, state }) => (
-                <button
-                  key={label}
-                  onClick={() => handleSetAllRelays(state)}
-                  disabled={!connected}
-                  style={{ fontFamily:"'Syne',sans-serif", fontSize:12, fontWeight:600, padding:'6px 14px', borderRadius:8, border:'1px solid var(--border)', background:'var(--bg3)', color:'var(--muted)', transition:'all .15s' }}
-                  onMouseEnter={e => { if(connected){(e.currentTarget as HTMLElement).style.borderColor='rgba(109,94,245,.4)';(e.currentTarget as HTMLElement).style.color='var(--text)';}}}
-                  onMouseLeave={e => {(e.currentTarget as HTMLElement).style.borderColor='var(--border)';(e.currentTarget as HTMLElement).style.color='var(--muted)';}}
-                >{label}</button>
-              ))}
-            </div>
-          </div>
-
-          <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit,minmax(200px,1fr))', gap:12 }}>
-            {RELAY_IDS.map(id => {
-              const isON = relays[id];
-              return (
-                <div key={id} className="card-hover" style={{ background:'var(--bg3)', borderRadius:14, padding:18, display:'flex', flexDirection:'column', gap:14, border: isON ? '1px solid var(--border-accent)' : '1px solid var(--border)', boxShadow: isON ? '0 0 28px rgba(109,94,245,0.08)' : 'none', transition:'border-color .2s,box-shadow .2s', position:'relative', overflow:'hidden' }}>
-                  {isON && <div style={{ position:'absolute', inset:0, pointerEvents:'none', background:'linear-gradient(135deg,rgba(109,94,245,0.04) 0%,transparent 60%)' }} />}
-                  <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between' }}>
-                    <span style={{ fontSize:15, fontWeight:700, color:'var(--text)' }}>Lampu {id}</span>
-                    <div className={isON ? 'led-glow' : ''} style={{ width:11, height:11, borderRadius:'50%', background: isON ? 'var(--accent)' : 'var(--muted2)', transition:'all .3s' }} />
-                  </div>
-                  <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
-                    <span className="mono" style={{ fontSize:10, padding:'3px 8px', borderRadius:4, letterSpacing:'.05em', alignSelf:'flex-start', ...(isON ? { background:'var(--accent-dim)', color:'var(--accent)', border:'1px solid var(--border-accent)' } : { background:'var(--muted2)', color:'var(--muted)', border:'1px solid rgba(255,255,255,0.05)' }) }}>
-                      {isON ? 'MENYALA' : 'MATI'}
-                    </span>
-                    <button
-                      onClick={() => toggleRelay(id)}
-                      disabled={!connected}
-                      className={`relay-btn ${isON ? 'is-on' : 'is-off'}`}
-                    >
-                      <Power size={14} />
-                      {isON ? 'Matikan' : 'Nyalakan'}
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+        {/* All Commands */}
+        <div className="flex gap-4">
+          <button
+            onClick={() => setAllRelays(true)}
+            disabled={!connected || isVariationActive}
+            className="flex-1 py-3 bg-[#1A1A1A] hover:bg-[#2A2A2A] disabled:opacity-50 disabled:cursor-not-allowed border border-[#2D2D2D] rounded-xl text-white font-medium transition-colors focus:ring-2 focus:ring-[#DD6B20]/50 outline-none"
+          >
+            Semua ON
+          </button>
+          <button
+            onClick={() => setAllRelays(false)}
+            disabled={!connected || isVariationActive}
+            className="flex-1 py-3 bg-[#1A1A1A] hover:bg-[#2A2A2A] disabled:opacity-50 disabled:cursor-not-allowed border border-[#2D2D2D] rounded-xl text-white font-medium transition-colors focus:ring-2 focus:ring-[#DD6B20]/50 outline-none"
+          >
+            Semua OFF
+          </button>
         </div>
 
-        {/* ── VARIATION ── */}
-        <div className="card-hover" style={{ background:'var(--bg2)', border:'1px solid var(--border)', borderRadius:16, padding:20, marginBottom:14 }}>
-          <div className="mono" style={{ fontSize:11, fontWeight:600, letterSpacing:'.1em', textTransform:'uppercase', color:'var(--muted)', marginBottom:8, display:'flex', alignItems:'center', gap:8 }}>
-            <Play size={13} color="var(--accent)" /> Variasi Lampu
+        {/* Relay Grid */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          {[1, 2, 3, 4].map((id) => {
+            const isON = relays[id as keyof typeof relays];
+            const isLoading = loadingRelays[id];
+            
+            return (
+              <div key={id} className="bg-[#1A1A1A] p-5 rounded-xl border border-[#2D2D2D] flex flex-col justify-between space-y-6 transition-all hover:border-[#3D3D3D]">
+                <div className="flex items-center justify-between">
+                  <span className="font-semibold text-gray-200">Lampu {id}</span>
+                  <div className={`w-3.5 h-3.5 rounded-full transition-all duration-300 ${isON ? 'bg-[#DD6B20] shadow-[0_0_12px_rgba(221,107,32,0.8)]' : 'bg-[#3D1A00]'}`}></div>
+                </div>
+                
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-bold tracking-widest uppercase">
+                    {isON ? <span className="text-[#DD6B20]">Menyala</span> : <span className="text-gray-500">Mati</span>}
+                  </span>
+                  
+                  <button
+                    onClick={() => toggleRelay(id)}
+                    disabled={!connected || isVariationActive || isLoading}
+                    className={`px-4 py-2.5 rounded-lg text-sm font-semibold transition-all flex items-center space-x-2 focus:ring-2 focus:ring-[#DD6B20]/50 outline-none
+                      ${isON 
+                        ? 'bg-[#3D1A00] text-[#FBD38D] hover:bg-[#4D2000] border border-[#DD6B20]/20' 
+                        : 'bg-[#DD6B20] text-white hover:bg-[#ED8936] shadow-lg shadow-[#DD6B20]/20 border border-transparent'
+                      } disabled:opacity-40 disabled:cursor-not-allowed`}
+                  >
+                    {isLoading ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <Power className="w-4 h-4" />
+                    )}
+                    <span>{isON ? 'Matikan' : 'Nyalakan'}</span>
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Variations */}
+        <div className="bg-[#1A1A1A] p-6 rounded-xl border border-[#2D2D2D] space-y-4">
+          <div className="space-y-1">
+            <h2 className="text-lg font-medium text-white">Variasi Lampu</h2>
+            <p className="text-sm text-gray-500 leading-relaxed">Pilih mode variasi otomatis. Mode individual (manual) akan dinonaktifkan secara otomatis saat variasi sedang berjalan.</p>
           </div>
-          <p className="mono" style={{ fontSize:10, color:'var(--muted)', marginBottom:16, lineHeight:1.6 }}>
-            Mode otomatis berjalan lokal. Klik tombol relay atau ucapkan perintah manual untuk stop variasi & kontrol manual.
-          </p>
-          <div style={{ display:'flex', gap:10, flexWrap:'wrap' }}>
-            {varMeta.map(({ id, label, desc, icon }) => (
-              <button
-                key={id}
-                onClick={() => setVariation(id)}
-                disabled={!connected}
-                title={desc}
-                style={{ flex:1, minWidth:110, padding:'12px 14px', borderRadius:12, fontFamily:"'Syne',sans-serif", fontSize:13, fontWeight:600, display:'flex', alignItems:'center', justifyContent:'center', gap:8, flexDirection:'column', transition:'all .15s', ...(variasi === id ? { background:'var(--accent-dim)', border:'1px solid var(--border-accent)', color:'var(--accent)', boxShadow:'0 0 20px rgba(109,94,245,.12)' } : { background:'var(--bg3)', border:'1px solid var(--border)', color:'var(--muted)' }) }}
-              >
-                <span style={{ display:'flex', alignItems:'center', gap:6 }}>{icon} {label}</span>
-                <span className="mono" style={{ fontSize:9, opacity:.7, textAlign:'center', letterSpacing:0, textTransform:'none', fontWeight:400 }}>{desc}</span>
-              </button>
-            ))}
+          
+          <div className="flex flex-wrap gap-3 pt-2">
+            <button
+              onClick={() => setVariation(1)}
+              disabled={!connected}
+              className={`flex-1 min-w-[120px] py-3.5 px-4 rounded-xl font-medium flex items-center justify-center space-x-2 transition-all border outline-none focus:ring-2 focus:ring-[#DD6B20]/50
+                ${variasi === 1 
+                  ? 'bg-[#DD6B20]/10 text-[#DD6B20] border-[#DD6B20]/50 shadow-[0_0_20px_rgba(221,107,32,0.15)] ring-1 ring-[#DD6B20]/50' 
+                  : 'bg-[#151515] text-gray-400 border-[#2D2D2D] hover:border-gray-500 hover:text-white'
+                } disabled:opacity-50`}
+            >
+              <Play className={`w-4 h-4 ${variasi === 1 ? 'fill-current' : ''}`} />
+              <span>Variasi 1</span>
+            </button>
+
+            <button
+              onClick={() => setVariation(2)}
+              disabled={!connected}
+              className={`flex-1 min-w-[120px] py-3.5 px-4 rounded-xl font-medium flex items-center justify-center space-x-2 transition-all border outline-none focus:ring-2 focus:ring-[#DD6B20]/50
+                ${variasi === 2 
+                  ? 'bg-[#DD6B20]/10 text-[#DD6B20] border-[#DD6B20]/50 shadow-[0_0_20px_rgba(221,107,32,0.15)] ring-1 ring-[#DD6B20]/50' 
+                  : 'bg-[#151515] text-gray-400 border-[#2D2D2D] hover:border-gray-500 hover:text-white'
+                } disabled:opacity-50`}
+            >
+              <Play className={`w-4 h-4 ${variasi === 2 ? 'fill-current' : ''}`} />
+              <span>Variasi 2</span>
+            </button>
+
             <button
               onClick={() => setVariation(0)}
               disabled={!connected || variasi === 0}
-              style={{ flex:1, minWidth:110, padding:'12px 14px', borderRadius:12, fontFamily:"'Syne',sans-serif", fontSize:13, fontWeight:600, display:'flex', alignItems:'center', justifyContent:'center', gap:8, transition:'all .15s', ...(variasi !== 0 ? { background:'rgba(255,95,126,.08)', border:'1px solid rgba(255,95,126,.3)', color:'var(--danger)' } : { background:'var(--bg3)', border:'1px solid var(--border)', color:'var(--muted2)' }) }}
+              className={`flex-1 min-w-[120px] py-3.5 px-4 rounded-xl font-medium flex items-center justify-center space-x-2 transition-all border outline-none focus:ring-2 focus:ring-red-500/50
+                ${variasi !== 0 
+                  ? 'bg-red-500/10 text-red-500 border-red-500/30 hover:bg-red-500/20 shadow-[0_0_15px_rgba(239,68,68,0.1)]' 
+                  : 'bg-[#151515] text-gray-600 border-[#2D2D2D]'
+                } disabled:opacity-50`}
             >
-              <Square size={12} fill="currentColor" /> Stop
+              <Square className="fill-current w-3.5 h-3.5" />
+              <span>Stop Variasi</span>
             </button>
-          </div>
-        </div>
-
-        {/* ── LOG ── */}
-        <div style={{ background:'var(--bg2)', border:'1px solid var(--border)', borderRadius:14, overflow:'hidden' }}>
-          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'14px 18px', borderBottom:'1px solid var(--border)' }}>
-            <div style={{ display:'flex', alignItems:'center', gap:10 }}>
-              <span className="mono" style={{ fontSize:11, fontWeight:600, letterSpacing:'.1em', textTransform:'uppercase', color:'var(--muted)' }}>Aktivitas</span>
-              <span className="mono" style={{ fontSize:10, padding:'2px 8px', borderRadius:10, background:'var(--accent-dim)', color:'var(--accent)', border:'1px solid var(--border-accent)' }}>{logs.length}</span>
-            </div>
-            <button onClick={() => setLogs([])} style={{ fontFamily:"'DM Mono',monospace", fontSize:11, color:'var(--muted)', background:'none', border:'none', transition:'color .15s', display:'flex', alignItems:'center', gap:4 }} onMouseEnter={e => (e.currentTarget as HTMLElement).style.color='var(--danger)'} onMouseLeave={e => (e.currentTarget as HTMLElement).style.color='var(--muted)'}>
-              <Trash2 size={12} /> Hapus
-            </button>
-          </div>
-          <div className="log-scroll">
-            {logs.length === 0
-              ? <div className="mono" style={{ padding:32, textAlign:'center', fontSize:12, color:'var(--muted2)' }}>Belum ada aktivitas...</div>
-              : logs.map((l, i) => (
-                <div key={i} className="log-row" style={{ display:'flex', alignItems:'flex-start', gap:12, padding:'9px 18px', borderBottom:'1px solid rgba(255,255,255,0.03)' }}>
-                  <span className="mono" style={{ fontSize:10, color:'var(--muted)', whiteSpace:'nowrap', paddingTop:1, minWidth:60 }}>{l.time}</span>
-                  <div style={{ width:7, height:7, borderRadius:'50%', flexShrink:0, marginTop:5, background: l.type==='on'?'var(--accent)':l.type==='off'?'var(--muted)':l.type==='voice'?'#ff5f7e':l.type==='err'?'var(--danger)':l.type==='warn'?'var(--warn)':'var(--success)' }} />
-                  <span style={{ fontSize:13, color:'var(--text)', lineHeight:1.4, flex:1 }}>
-                    {l.msg}
-                    <span className="mono" style={{ fontSize:9, fontWeight:500, padding:'2px 6px', borderRadius:3, letterSpacing:'.05em', marginLeft:6, verticalAlign:'middle', ...(l.source==='web'?{background:'var(--accent-dim)',color:'var(--accent)'}:l.source==='voice'?{background:'rgba(255,95,126,0.1)',color:'var(--danger)'}:{background:'var(--muted2)',color:'var(--muted)'}) }}>
-                      {l.source.toUpperCase()}
-                    </span>
-                  </span>
-                </div>
-              ))
-            }
           </div>
         </div>
 
@@ -588,3 +284,4 @@ export default function App() {
     </div>
   );
 }
+
