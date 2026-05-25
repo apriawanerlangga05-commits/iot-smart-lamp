@@ -1,0 +1,6 @@
+{
+  "name": "IoT Home Control Dashboard",
+  "description": "A single-page IoT control panel to manage 4 relays and monitor DHT11 sensors via MQTT over WebSocket.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
